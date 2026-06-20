@@ -1,0 +1,34 @@
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Icon?
+._*
+.Spotlight-V100
+.Trashes
+.fseventsd
+
+# Editors and local workspace state
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Rust build outputs
+/target/
+**/target/
+
+# Rust profiling and coverage outputs
+*.profraw
+*.profdata
+coverage/
+tarpaulin-report.html
+
+# Local environment and logs
+.env
+.env.*
+*.log
+
+# ngit local repo memory/runtime
+/.ngit/

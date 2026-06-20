@@ -1,0 +1,120 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build release artifact (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        run: rustup toolchain install stable --profile minimal --component rustfmt,clippy
+
+      - name: Use Rust stable
+        run: rustup default stable
+
+      - name: Cache Cargo data
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-release-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-release-cargo-
+
+      - name: Validate release build inputs
+        run: |
+          cargo fetch --locked
+          cargo fmt --all -- --check
+          cargo clippy --workspace --all-targets --locked -- -D warnings
+          cargo test --workspace --locked
+
+      - name: Build ngit
+        run: cargo build --release --locked -p ngit-cli
+
+      - name: Package Unix artifact
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          os="$(printf '%s' "$RUNNER_OS" | tr '[:upper:]' '[:lower:]')"
+          arch="$(printf '%s' "$RUNNER_ARCH" | tr '[:upper:]' '[:lower:]')"
+          version="${GITHUB_REF_NAME:-manual}"
+          asset="ngit-${version}-${os}-${arch}.tar.gz"
+          mkdir -p dist
+          tar -czf "dist/${asset}" -C target/release ngit
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "dist/${asset}" > "dist/${asset}.sha256"
+          else
+            sha256sum "dist/${asset}" > "dist/${asset}.sha256"
+          fi
+
+      - name: Package Windows artifact
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $os = $env:RUNNER_OS.ToLowerInvariant()
+          $arch = $env:RUNNER_ARCH.ToLowerInvariant()
+          $version = if ($env:GITHUB_REF_NAME) { $env:GITHUB_REF_NAME } else { "manual" }
+          $asset = "ngit-$version-$os-$arch.zip"
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Compress-Archive -Path target/release/ngit.exe -DestinationPath "dist/$asset" -Force
+          $hash = Get-FileHash -Algorithm SHA256 "dist/$asset"
+          "$($hash.Hash.ToLowerInvariant())  dist/$asset" | Out-File -Encoding ascii "dist/$asset.sha256"
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ngit-${{ matrix.os }}
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    name: Publish GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME}"
+          if ! gh release view "$tag" >/dev/null 2>&1; then
+            gh release create "$tag" --title "$tag" --notes "Automated ngit release for ${tag}."
+          fi
+          find dist -type f -print0 | while IFS= read -r -d '' file; do
+            gh release upload "$tag" "$file" --clobber
+          done

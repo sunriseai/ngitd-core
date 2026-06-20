@@ -1,0 +1,20 @@
+[package]
+name = "ngit-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "ngit"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+ngit-core = { path = "../ngit-core" }
+ngit-serve = { path = "../ngit-serve" }
+ngit-tui = { path = "../ngit-tui" }
+serde.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,9 @@
+[package]
+name = "ngit-tui"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+ngit-core = { path = "../ngit-core" }
+
