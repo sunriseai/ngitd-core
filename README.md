@@ -1,6 +1,6 @@
 # ngitd core
 
-<img src="assets/product_logo.png" width=500 alt="abstract logo">
+<img src="assets/project_logo.png" width=500 alt="abstract logo">
 
 `ngitd core` is a local memory layer for software changes. It records what a
 Git repo looked like, what change was captured, what evidence was attached, and
