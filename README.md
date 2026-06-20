@@ -1,8 +1,8 @@
-# ngitd core
+# Add Decision Data to Code Changes
 
-<img src="assets/project_logo.png" width=500 alt="abstract logo">
+<img src="assets/project_logo.png" width=300 alt="abstract logo">
 
-`ngitd core` is a local memory layer for software changes. It records what a
+This project, `ngitd core` (EN-git-dee), is a local memory layer for software changes. It records what a
 Git repo looked like, what change was captured, what evidence was attached, and
 what terminal disposition a human or supervisor recorded later.
 
