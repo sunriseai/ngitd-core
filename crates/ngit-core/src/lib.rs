@@ -1,4 +1,4 @@
-use rand::{distributions::Alphanumeric, Rng};
+use rand::distr::{Alphanumeric, SampleString};
 use schemars::{schema_for, JsonSchema};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -776,7 +776,7 @@ pub fn add_evidence_from_file(
         "file",
         &artifact_path,
         false,
-        Some(relative_to_root(&root, &source)),
+        Some(PathBuf::from(file_name)),
     )?];
     write_evidence_with_input(
         &root,
@@ -2089,12 +2089,8 @@ fn new_id(prefix: &str) -> String {
             "[year][month][day]T[hour][minute][second]Z"
         ))
         .unwrap();
-    let suffix: String = rand::thread_rng()
-        .sample_iter(&Alphanumeric)
-        .take(8)
-        .map(char::from)
-        .map(|ch| ch.to_ascii_lowercase())
-        .collect();
+    let mut rng = rand::rng();
+    let suffix = Alphanumeric.sample_string(&mut rng, 8).to_ascii_lowercase();
     format!("{prefix}-{ts}-{suffix}")
 }
 
