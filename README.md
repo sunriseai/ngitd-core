@@ -1,4 +1,4 @@
-# Add Decision Data to Code Changes
+# Preserve Decision Data, not just Code Changes
 
 <img src="assets/project_logo.png" width=300 alt="abstract logo">
 
