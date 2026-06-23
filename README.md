@@ -12,6 +12,20 @@ whether a broader workflow should proceed.
 
 ## Getting Started
 
+New to this codebase, or experienced in other languages but new to Rust? Start
+with the guided Code Hike walkthrough at
+[docs/walkthrough.mdx](./docs/walkthrough.mdx). It explains the main CLI and core
+library paths through concrete Rust concepts: ownership, `Result`, enum matching,
+traits, iterator chains, and lock cleanup.
+
+To preview the walkthrough locally:
+
+```text
+cd walkthrough-preview
+npm install
+npm run dev -- --hostname 127.0.0.1 --port 3027
+```
+
 Build and test the workspace:
 
 ```text
@@ -94,6 +108,22 @@ should be recorded as evidence or annotation with explicit provenance.
 Some JSON field names still use compatibility terminology, especially
 `readiness` and `decision_context`. In the current product model those fields
 carry neutral evidence-rollup context, not core-owned workflow judgement.
+
+## Reviewing Rust Changes
+
+If you are reviewing this repository as a new Rust reader, read
+[docs/walkthrough.mdx](./docs/walkthrough.mdx) before changing core
+capture/evidence/lineage behavior. It calls out the Rust-specific patterns that
+matter in this codebase: whether a value is moved, borrowed, or cloned; where
+`?` propagates errors; which enum matches need to stay exhaustive; which generic
+helpers rely on `Serialize` or `DeserializeOwned`; and how lock lifetimes are
+controlled by ownership.
+
+When code in the highlighted walkthrough paths changes materially, check whether
+the walkthrough still teaches the same thing. Update it for changes to CLI
+dispatch, record types, error handling, capture/evidence flow, lineage, or
+locking behavior; small formatting or local implementation changes usually do
+not need documentation churn.
 
 ## Local API
 

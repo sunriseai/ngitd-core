@@ -1,0 +1,764 @@
+<CH.Scrollycoding>
+
+This program is a local Git-adjacent recorder: the CLI observes repository state, captures drafts of uncommitted changes, attaches intent and evidence, and later accepts or rejects those drafts with lineage. The first Rust-specific thing to notice is that the command-line grammar is data, not hand-written parser code. `clap` reads these structs and enums through derived trait implementations, so adding a command mostly means adding a new enum variant and an argument struct. In a Python or Go CLI you might write a chain of parser registrations; here, Rust's type system becomes the registry.
+
+```rust crates/ngit-cli/src/main.rs focus=1:37
+#[derive(Debug, Parser)]
+#[command(name = "ngit")]
+#[command(about = "Local code-editing blackbox for evidence, intent, rationale, and lineage")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    Init(JsonFlag),
+    Status(JsonFlag),
+    Watch(WatchArgs),
+    Capture(CaptureArgs),
+    Drafts(JsonFlag),
+    Show(ShowArgs),
+    Annotation {
+        #[command(subcommand)]
+        command: AnnotationCommand,
+    },
+    Evidence {
+        #[command(subcommand)]
+        command: EvidenceCommand,
+    },
+    Accept(AcceptArgs),
+    Reject(RejectArgs),
+    History(JsonFlag),
+    Lineage(ShowArgs),
+    Doctor(JsonFlag),
+    Schema {
+        #[command(subcommand)]
+        command: SchemaCommand,
+    },
+    Migrate(JsonFlag),
+    Tui(TuiArgs),
+    Serve(ServeArgs),
+}
+```
+
+---
+
+The executable keeps process exit behavior separate from application logic. `main` does not perform any Git work; it only converts the result of `run` into a process status. That `match` is Rust's ordinary enum handling: success carries `()`, the unit value, and failure carries a typed error that can be formatted. A JS or Python version might let an exception bubble to the runtime; this code decides explicitly what the operating system should see.
+
+```rust crates/ngit-cli/src/main.rs focus=1:8
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!("ngit: {err}");
+            ExitCode::from(1)
+        }
+    }
+}
+```
+
+---
+
+The central dispatch consumes `cli.command` and pattern-matches on the exact command variant. That consumption is intentional: after the match begins, each arm owns only the argument struct it needs, so fields like `args.intent` can be moved directly into library options without copying. At the same time, `cwd` is borrowed as `&cwd` over and over because the library only needs to read the path, not take ownership of it. The `?` operator makes every fallible core call either produce a value for the arm or return early from `run`. In an OOP CLI, this might be a method table or inheritance hierarchy; Rust reaches for enum variants plus exhaustive matching.
+
+```rust crates/ngit-cli/src/main.rs focus=1:48
+fn run() -> CoreResult<()> {
+    let cli = Cli::parse();
+    let cwd = std::env::current_dir().map_err(|source| ngit_core::CoreError::Io {
+        path: PathBuf::from("."),
+        source,
+    })?;
+    match cli.command {
+        Commands::Init(args) => {
+            let record = init(&cwd)?;
+            output(args.json, &record, || {
+                format!(
+                    "initialized .ngit at {}",
+                    record.repo.root.join(".ngit").display()
+                )
+            })
+        }
+        Commands::Status(args) => {
+            let record = status(&cwd)?;
+            output(args.json, &record, || {
+                format!(
+                    "repo: {}\nbranch: {}\ndirty: {}\nopen drafts: {}",
+                    record.repo_root.display(),
+                    record.snapshot.branch,
+                    record.snapshot.dirty,
+                    record.open_drafts
+                )
+            })
+        }
+        Commands::Watch(args) => loop {
+            if args.capture {
+                let (event, draft) = watch_capture_once(&cwd)?;
+                print_watch_capture(args.json, &event, draft.as_ref())?;
+            } else {
+                let event = watch_once(&cwd)?;
+                print_watch_event(args.json, &event)?;
+            }
+            if args.once {
+                break Ok(());
+            }
+            thread::sleep(Duration::from_secs(args.interval.max(1)));
+        },
+        Commands::Capture(args) => {
+            let record = capture(
+                &cwd,
+                CaptureOptions {
+                    trigger: args.trigger,
+                    intent: args.intent,
+                },
+            )?;
+            output(args.json, &record, || {
+                format!("captured {}: {}", record.draft_id, record.summary)
+            })
+        }
+        Commands::Drafts(args) => {
+            let records = list_drafts(&cwd)?;
+            output(args.json, &records, || {
+                records
+                    .iter()
+                    .map(|draft| {
+                        format!(
+                            "{} evidence_state={}",
+                            draft.draft_id, draft.readiness.final_action
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            })
+        }
+        Commands::Show(args) => {
+            let record = show_record(&cwd, &args.id)?;
+            output(args.json, &record, || format!("{record:#?}"))
+        }
+        Commands::Annotation { command } => match command {
+            AnnotationCommand::Add(args) => {
+                let record = add_annotation(
+                    &cwd,
+                    AnnotationInput {
+                        owner_id: args.owner_id,
+                        annotation_type: args.annotation_type,
+                        status: args.status,
+                        summary: args.summary,
+                        body: args.body,
+                        producer_kind: args.producer,
+                    },
+                )?;
+                output(args.json, &record, || {
+                    format!("added annotation {}", record.annotation_id)
+                })
+            }
+            AnnotationCommand::List(args) => {
+                let records = list_annotations(&cwd, &args.owner_id)?;
+                output(args.json, &records, || {
+                    records
+                        .iter()
+                        .map(|record| {
+                            format!(
+                                "{} {} {}",
+                                record.annotation_id,
+                                record.annotation_type,
+                                record.summary.clone().unwrap_or_default()
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+            }
+            AnnotationCommand::Show(args) => {
+                let record = show_record(&cwd, &args.id)?;
+                output(args.json, &record, || format!("{record:#?}"))
+            }
+        },
+        Commands::Evidence { command } => match command {
+            EvidenceCommand::Add(args) => {
+                let record = add_evidence_from_file(&cwd, &args.draft_id, &args.file)?;
+                output(args.json, &record, || {
+                    format!("added evidence {}", record.evidence_id)
+                })
+            }
+            EvidenceCommand::Run(args) => {
+                let record = run_evidence_with_options(
+                    &cwd,
+                    &args.draft_id,
+                    &args.command,
+                    EvidenceRunOptions {
+                        timeout: Duration::from_secs(args.timeout_seconds),
+                        max_output_bytes: args.max_output_bytes,
+                    },
+                )?;
+                output(args.json, &record, || {
+                    format!("evidence {} {}", record.evidence_id, record.status)
+                })
+            }
+        },
+        Commands::Accept(args) => {
+            let record = accept(&cwd, &args.draft_id, args.override_reason)?;
+            output(args.json, &record, || {
+                format!("accepted {}", record.change_id)
+            })
+        }
+        Commands::Reject(args) => {
+            let record = reject(&cwd, &args.draft_id, args.reason)?;
+            output(args.json, &record, || {
+                format!("rejected {}", record.draft_id)
+            })
+        }
+        Commands::History(args) => {
+            let records = history(&cwd)?;
+            output(args.json, &records, || {
+                format!("{} terminal records", records.len())
+            })
+        }
+        Commands::Lineage(args) => {
+            let record = lineage(&cwd, &args.id)?;
+            output(args.json, &record, || format!("{record:#?}"))
+        }
+        Commands::Doctor(args) => {
+            let record = doctor(&cwd)?;
+            output(args.json, &record, || {
+                if record.issues.is_empty() {
+                    "doctor: ok".to_string()
+                } else {
+                    format!("doctor: {} issue(s)", record.issues.len())
+                }
+            })
+        }
+        Commands::Schema { command } => match command {
+            SchemaCommand::Export(args) => {
+                let record = export_json_schemas(&args.dir)?;
+                output(args.json, &record, || {
+                    format!("exported {} schema files", record.files.len())
+                })
+            }
+        },
+        Commands::Migrate(args) => {
+            let record = migrate_legacy(&cwd)?;
+            output(args.json, &record, || {
+                format!(
+                    "migration imported {} records; skipped {}",
+                    record.imported.values().sum::<usize>(),
+                    record.skipped.len()
+                )
+            })
+        }
+        Commands::Tui(args) => {
+            let record = status(&cwd)?;
+            let drafts = list_drafts(&cwd)?;
+            println!(
+                "{}",
+                ngit_tui::render_overview(&record, &drafts, args.read_only)?
+            );
+            Ok(())
+        }
+        Commands::Serve(args) => ngit_serve::serve_with_options(
+            &cwd,
+            ngit_serve::ServeOptions {
+                bind: args.bind,
+                once: args.once,
+                token: args.token,
+                allow_non_loopback: args.allow_non_loopback,
+                require_auth_for_read: args.require_auth_for_read,
+            },
+        )
+        .map_err(|err| ngit_core::CoreError::InvalidInput(err.to_string())),
+    }
+}
+```
+
+---
+
+The library uses one error enum as the vocabulary for everything that can go wrong in core operations. `thiserror::Error` derives the standard `Error` behavior and uses each `#[error(...)]` attribute as the display message, so error formatting stays next to the variant that carries the data. Variants can be tuple-like, struct-like, or data-free, which replaces the "base exception class plus subclasses" pattern common in other languages. The alias at the top keeps signatures readable while still preserving the full error type.
+
+```rust crates/ngit-core/src/lib.rs focus=1:39
+pub type CoreResult<T> = Result<T, CoreError>;
+
+#[derive(Debug, Error)]
+pub enum CoreError {
+    #[error("not a Git repo: {0}")]
+    NotGitRepo(PathBuf),
+    #[error(".ngit is not initialized at {0}")]
+    NotInitialized(PathBuf),
+    #[error("unsupported schema version {version} in {path}")]
+    UnsupportedSchema { path: PathBuf, version: u32 },
+    #[error("malformed JSON at {path}: {source}")]
+    MalformedJson {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    #[error("ambiguous id prefix: {0}")]
+    AmbiguousId(String),
+    #[error("record not found: {0}")]
+    MissingRecord(String),
+    #[error("draft not found: {0}")]
+    MissingDraft(String),
+    #[error("evidence owner missing: {0}")]
+    EvidenceOwnerMissing(String),
+    #[error("annotation owner missing: {0}")]
+    AnnotationOwnerMissing(String),
+    #[error("lock held by active process: {0}")]
+    LockHeld(PathBuf),
+    #[error("Git command failed: {0}")]
+    GitCommandFailed(String),
+    #[error("dirty state changed since draft capture: {0}")]
+    DirtyStateChanged(String),
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+    #[error("io error at {path}: {source}")]
+    Io {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+}
+```
+
+---
+
+These record types are plain structs, but the derives give them behavior that another language might put in a model superclass or reflection framework. `Serialize`, `Deserialize`, and `JsonSchema` are trait implementations generated at compile time; `Clone`, `PartialEq`, and `Eq` are also explicit capabilities, not assumed by default. `Option<String>` is Rust's nullable value, but it must be handled as an enum rather than silently used as a string. The `#[serde(rename = "type")]` attribute is a good example of Rust code keeping a valid field name while controlling the external JSON shape.
+
+```rust crates/ngit-core/src/lib.rs focus=1:49
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct RepoSnapshot {
+    pub schema_version: u32,
+    pub captured_at: String,
+    pub repo_root: PathBuf,
+    pub branch: String,
+    pub head: Option<String>,
+    pub head_parent_count: u32,
+    pub changed_files: Vec<ChangedFile>,
+    pub recent_commits: Vec<CommitSummary>,
+    pub staged_digest: String,
+    pub worktree_digest: String,
+    pub dirty: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ChangedFile {
+    pub path: String,
+    pub index_status: String,
+    pub worktree_status: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct DraftChange {
+    pub schema_version: u32,
+    pub draft_id: String,
+    pub status: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub capture: CaptureInfo,
+    pub repo_snapshot: RepoSnapshot,
+    pub changed_paths: Vec<String>,
+    pub summary: String,
+    pub annotation_refs: Vec<String>,
+    pub evidence_refs: Vec<String>,
+    pub readiness: DecisionContext,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+pub struct AnnotationRecord {
+    pub schema_version: u32,
+    pub annotation_id: String,
+    pub owner: RecordOwner,
+    #[serde(rename = "type")]
+    pub annotation_type: String,
+    pub status: String,
+    pub summary: Option<String>,
+    pub body: String,
+    pub producer: Producer,
+}
+```
+
+---
+
+`capture` is where ownership becomes concrete rather than theoretical. The snapshot is first borrowed to derive `changed_paths`, then moved into `repo_snapshot`; after that, this function cannot keep using `snapshot` because the draft owns it. Strings that must be reused, such as `draft_id` and `options.trigger`, are cloned deliberately, while `options.intent` is moved into `if let Some(intent)` because it is only needed in that branch. A Go or JS programmer might casually reuse these values after assignment; Rust forces each reuse to be either a borrow, a move, or an explicit clone.
+
+```rust crates/ngit-core/src/lib.rs focus=1:73
+pub fn capture(repo_path: &Path, options: CaptureOptions) -> CoreResult<DraftChange> {
+    let root = initialized_root(repo_path)?;
+    let _lock = StoreLock::acquire(&root, "capture")?;
+    let policy = capture_policy(&root)?;
+    let snapshot = repo_snapshot(&root)?;
+    if snapshot.changed_files.is_empty() && !policy.allow_empty_capture {
+        return Err(CoreError::InvalidInput(
+            "empty capture is disallowed by policy".to_string(),
+        ));
+    }
+    let capture_key = capture_key(&snapshot);
+    if policy.dedupe.enabled {
+        for draft in list_drafts(&root)? {
+            if draft.capture.capture_key == capture_key {
+                return Ok(draft);
+            }
+        }
+    }
+    let now = now_string();
+    let draft_id = new_id("draft");
+    let annotation_refs = Vec::new();
+    let changed_paths = snapshot
+        .changed_files
+        .iter()
+        .map(|file| file.path.clone())
+        .collect::<Vec<_>>();
+    let mut draft = DraftChange {
+        schema_version: 1,
+        draft_id: draft_id.clone(),
+        status: "draft".to_string(),
+        created_at: now.clone(),
+        updated_at: now,
+        capture: CaptureInfo {
+            source: "ngit-core".to_string(),
+            trigger: options.trigger.clone(),
+            capture_key,
+            deduped_from: None,
+        },
+        repo_snapshot: snapshot,
+        changed_paths,
+        summary: String::new(),
+        annotation_refs,
+        evidence_refs: vec![],
+        readiness: compute_readiness_for_refs(&root, &[])?,
+    };
+    draft.summary = format!(
+        "Captured {} change affecting {} file{}.",
+        options.trigger,
+        draft.changed_paths.len(),
+        if draft.changed_paths.len() == 1 {
+            ""
+        } else {
+            "s"
+        }
+    );
+    write_json_atomic(&draft_path(&root, &draft_id), &draft)?;
+    if let Some(intent) = options.intent {
+        let annotation = add_annotation(
+            &root,
+            AnnotationInput {
+                owner_id: draft_id.clone(),
+                annotation_type: "intent".to_string(),
+                status: "supplied".to_string(),
+                summary: Some(first_line(&intent)),
+                body: intent,
+                producer_kind: "human".to_string(),
+            },
+        )?;
+        draft.annotation_refs.push(annotation.annotation_id);
+        draft.updated_at = now_string();
+        write_json_atomic(&draft_path(&root, &draft_id), &draft)?;
+    }
+    Ok(draft)
+}
+```
+
+---
+
+Running evidence shows Rust's enum matching as control flow, including a guard on one branch. `child.try_wait()` returns a `Result<Option<ExitStatus>, _>`: `?` handles the outer failure, then `match` handles whether the process has exited. The `None if ...` arm is a precise timeout case, and the final `None` arm sleeps and loops. In many languages this would be a mutable flag plus nested conditionals; Rust lets the return type drive the shape of the code.
+
+```rust crates/ngit-core/src/lib.rs focus=1:46
+pub fn run_evidence_with_options(
+    repo_path: &Path,
+    draft_id: &str,
+    command: &[String],
+    options: EvidenceRunOptions,
+) -> CoreResult<EvidenceRecord> {
+    let root = initialized_root(repo_path)?;
+    if command.is_empty() {
+        return Err(CoreError::InvalidInput(
+            "missing evidence command".to_string(),
+        ));
+    }
+    if load_draft(&root, draft_id).is_err() {
+        return Err(CoreError::EvidenceOwnerMissing(draft_id.to_string()));
+    }
+    let started = Instant::now();
+    let mut child = Command::new(&command[0])
+        .args(&command[1..])
+        .current_dir(&root)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|source| CoreError::Io {
+            path: PathBuf::from(&command[0]),
+            source,
+        })?;
+    let mut timed_out = false;
+    loop {
+        match child.try_wait().map_err(|source| CoreError::Io {
+            path: PathBuf::from(&command[0]),
+            source,
+        })? {
+            Some(_) => break,
+            None if started.elapsed() >= options.timeout => {
+                timed_out = true;
+                child.kill().map_err(|source| CoreError::Io {
+                    path: PathBuf::from(&command[0]),
+                    source,
+                })?;
+                break;
+            }
+            None => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    let output = child.wait_with_output().map_err(|source| CoreError::Io {
+        path: PathBuf::from(&command[0]),
+        source,
+    })?;
+    let duration_ms = started.elapsed().as_millis();
+    let status = if timed_out {
+        "blocked"
+    } else if output.status.success() {
+        "passed"
+    } else {
+        "failed"
+    };
+    let exit_code = output.status.code().unwrap_or(-1);
+    let command_evidence = CommandEvidence {
+        argv: command.to_vec(),
+        exit_code,
+        duration_ms,
+    };
+    let evidence_id = new_id("evidence");
+    let artifacts_dir = ngit_dir(&root)
+        .join("evidence/artifacts")
+        .join(&evidence_id);
+    fs::create_dir_all(&artifacts_dir).map_err(|source| CoreError::Io {
+        path: artifacts_dir.clone(),
+        source,
+    })?;
+    let stdout_path = artifacts_dir.join("stdout.log");
+    let stderr_path = artifacts_dir.join("stderr.log");
+    let (stdout, stdout_truncated) = redact_and_truncate(&output.stdout, options.max_output_bytes);
+    let (stderr, stderr_truncated) = redact_and_truncate(&output.stderr, options.max_output_bytes);
+    fs::write(&stdout_path, stdout).map_err(|source| CoreError::Io {
+        path: stdout_path.clone(),
+        source,
+    })?;
+    fs::write(&stderr_path, stderr).map_err(|source| CoreError::Io {
+        path: stderr_path.clone(),
+        source,
+    })?;
+    let artifacts = vec![
+        artifact_ref(&root, "stdout", &stdout_path, stdout_truncated, None)?,
+        artifact_ref(&root, "stderr", &stderr_path, stderr_truncated, None)?,
+    ];
+    let summary = if timed_out {
+        format!(
+            "Command timed out after {} seconds.",
+            options.timeout.as_secs()
+        )
+    } else {
+        format!("Command exited with status {exit_code}.")
+    };
+    write_evidence_with_input(
+        &root,
+        EvidenceWriteInput {
+            draft_id,
+            evidence_id,
+            evidence_type: "command_check",
+            status,
+            summary,
+            command: Some(command_evidence),
+            artifacts,
+        },
+    )
+}
+```
+
+---
+
+The watch path has two iterator chains that are idiomatic Rust in different ways. The nested `any` calls short-circuit when a signal matches a configured trigger, so there is no manual loop state to maintain. Then `drop(_lock)` explicitly releases the RAII lock before calling `capture`, because `capture` needs to acquire another lock and Rust would otherwise keep `_lock` alive until the end of the scope. A reader from a garbage-collected language may expect cleanup to happen eventually; Rust makes deterministic cleanup part of lexical ownership.
+
+```rust crates/ngit-core/src/lib.rs focus=8:26
+pub fn watch_capture_once(repo_path: &Path) -> CoreResult<(EventRecord, Option<DraftChange>)> {
+    let root = initialized_root(repo_path)?;
+    let _lock = StoreLock::acquire(&root, "watch")?;
+    let snapshot = repo_snapshot(&root)?;
+    let event = event_from_snapshot(snapshot.clone(), "repo_changed");
+    write_json_atomic(&event_path(&root, &event.event_id), &event)?;
+    let policy = capture_policy(&root)?;
+    let should_capture = policy.mode == "auto"
+        && event
+            .signals
+            .iter()
+            .any(|signal| policy.triggers.iter().any(|trigger| trigger == signal));
+    if should_capture {
+        drop(_lock);
+        let draft = capture(
+            &root,
+            CaptureOptions {
+                trigger: "watch".to_string(),
+                intent: None,
+            },
+        )?;
+        Ok((event, Some(draft)))
+    } else {
+        Ok((event, None))
+    }
+}
+```
+
+---
+
+The `Record` enum is a sum type: a value is exactly one of these variants, each carrying a different record struct. `owner_for` matches all variants to compute a string label, and the compiler can warn if a new record variant is added without updating this match. This is a common Rust alternative to inheritance or tagged dictionaries: the tag and payload are one typed value, and pattern matching is the dispatch mechanism. The `_` wildcard is not used here, which is deliberate because explicit arms preserve exhaustiveness as the model grows.
+
+```rust crates/ngit-core/src/lib.rs focus=1:10,12:25
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[serde(tag = "kind", content = "record")]
+pub enum Record {
+    Draft(DraftChange),
+    Annotation(AnnotationRecord),
+    Evidence(EvidenceRecord),
+    Accepted(AcceptedChange),
+    Rejected(RejectedChange),
+    Lineage(LineageRecord),
+    Event(EventRecord),
+}
+
+fn owner_for(root: &Path, id: &str) -> CoreResult<RecordOwner> {
+    let owner_type = match resolve_record(root, id)? {
+        Record::Draft(_) => "draft",
+        Record::Accepted(_) => "accepted_change",
+        Record::Rejected(_) => "rejected_draft",
+        Record::Evidence(_) => "evidence",
+        Record::Lineage(_) => "lineage",
+        Record::Annotation(_) => "annotation",
+        Record::Event(_) => "event",
+    };
+    Ok(RecordOwner {
+        owner_type: owner_type.to_string(),
+        id: id.to_string(),
+    })
+}
+```
+
+---
+
+The JSON helpers are generic over traits instead of inheriting from a base model type. `read_json<T: DeserializeOwned>` can read any owned value that Serde knows how to deserialize, while `write_json_atomic<T: Serialize>` can write any serializable value by reference. The interesting Rust bit is that the type parameter is constrained by capabilities, not by ancestry. In a dynamic language this might be "try to JSON encode it and hope"; in Rust, the compiler rejects a call unless the type implements the required trait.
+
+```rust crates/ngit-core/src/lib.rs focus=1:23,25:54
+fn read_json<T: DeserializeOwned>(path: &Path) -> CoreResult<T> {
+    let file = File::open(path).map_err(|source| CoreError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let value: serde_json::Value =
+        serde_json::from_reader(file).map_err(|source| CoreError::MalformedJson {
+            path: path.to_path_buf(),
+            source,
+        })?;
+    if let Some(version) = value.get("schema_version").and_then(|value| value.as_u64()) {
+        if version != 1 {
+            return Err(CoreError::UnsupportedSchema {
+                path: path.to_path_buf(),
+                version: version as u32,
+            });
+        }
+    }
+    serde_json::from_value(value).map_err(|source| CoreError::MalformedJson {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
+fn write_json_atomic<T: Serialize>(path: &Path, value: &T) -> CoreResult<()> {
+    let dir = path.parent().ok_or_else(|| {
+        CoreError::InvalidInput(format!("path has no parent: {}", path.display()))
+    })?;
+    fs::create_dir_all(dir).map_err(|source| CoreError::Io {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    let mut tmp = NamedTempFile::new_in(dir).map_err(|source| CoreError::Io {
+        path: dir.to_path_buf(),
+        source,
+    })?;
+    serde_json::to_writer_pretty(&mut tmp, value).map_err(|source| CoreError::MalformedJson {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    tmp.write_all(b"\n").map_err(|source| CoreError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    tmp.as_file().sync_all().map_err(|source| CoreError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    tmp.persist(path).map_err(|err| CoreError::Io {
+        path: path.to_path_buf(),
+        source: err.error,
+    })?;
+    Ok(())
+}
+```
+
+---
+
+`StoreLock` is a small example of RAII, a Rust pattern where owning a value also owns cleanup responsibility. `StoreLock::acquire` creates a lock file and returns a struct that owns its path. The `Drop` implementation runs automatically when the value leaves scope, including early returns caused by `?`, so every successful acquisition has one cleanup point. In languages with `finally` or deferred cleanup, you might write that manually at each call site; here the cleanup lives with the resource type.
+
+```rust crates/ngit-core/src/lib.rs focus=1:37,39:43
+struct StoreLock {
+    path: PathBuf,
+}
+
+impl StoreLock {
+    fn acquire(root: &Path, name: &str) -> CoreResult<Self> {
+        let path = ngit_dir(root)
+            .join("runtime/locks")
+            .join(format!("{name}.lock"));
+        if path.exists() {
+            let metadata = fs::metadata(&path).map_err(|source| CoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
+            if metadata
+                .modified()
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .unwrap_or_default()
+                < Duration::from_secs(300)
+            {
+                return Err(CoreError::LockHeld(path));
+            }
+            let _ = fs::remove_file(&path);
+        }
+        let mut file = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|source| CoreError::Io {
+                path: path.clone(),
+                source,
+            })?;
+        writeln!(file, "pid={}", std::process::id()).map_err(|source| CoreError::Io {
+            path: path.clone(),
+            source,
+        })?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for StoreLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+```
+
+</CH.Scrollycoding>
+
+## Key Rust concepts
+
+- [Ownership and borrowing](https://doc.rust-lang.org/book/ch04-00-understanding-ownership.html): every value has one owner, and code must choose between moving, borrowing, or cloning data.
+- [Enums and pattern matching](https://doc.rust-lang.org/book/ch06-00-enums.html): enums model values that can be one of several variants, and `match` handles those variants exhaustively.
+- [Recoverable errors with `Result`](https://doc.rust-lang.org/book/ch09-02-recoverable-errors-with-result.html): fallible functions return `Result<T, E>`, and `?` propagates failures while unwrapping successes.
+- [Traits](https://doc.rust-lang.org/book/ch10-02-traits.html): traits describe capabilities such as serialization or display, and generic functions can require those capabilities.
+- [The `Drop` trait](https://doc.rust-lang.org/book/ch15-03-drop.html): types can define deterministic cleanup that runs automatically when owned values go out of scope.
+
+## Maintenance Note
+
+If you change the highlighted CLI dispatch, core record types, capture/evidence flow, lineage handling, JSON helpers, or lock lifecycle code, review this walkthrough and update the affected step. Small formatting changes usually do not require an update, but changes that alter the Rust concept being taught should be reflected here.
