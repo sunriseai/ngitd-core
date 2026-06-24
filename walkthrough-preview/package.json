@@ -2,18 +2,22 @@
   "name": "ngitd-core-walkthrough-preview",
   "private": true,
   "scripts": {
-    "dev": "next dev",
-    "build": "next build",
+    "dev": "next dev --webpack",
+    "build": "next build --webpack",
     "start": "next start"
   },
   "dependencies": {
     "@code-hike/lighter": "0.7.0",
     "@code-hike/mdx": "0.9.0",
+    "@mdx-js/loader": "3.1.1",
     "@mdx-js/react": "2.2.1",
-    "@next/mdx": "13.1.1",
-    "next": "13.1.1",
+    "@next/mdx": "16.2.9",
+    "next": "16.2.9",
+    "postcss": "8.5.15",
     "react": "18.2.0",
     "react-dom": "18.2.0"
   },
-  "devDependencies": {}
+  "overrides": {
+    "postcss": "8.5.15"
+  }
 }
